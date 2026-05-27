@@ -28,12 +28,22 @@ echo "[1/4] Setting up SHG-VQA..."
 bash scripts/setup_shgvqa.sh
 
 echo ""
-echo "[2/4] Downloading 100GB of MM-AU..."
-python mmau_adapter/download_partial.py
+echo "[2/4] Checking data..."
+VIDEO_COUNT=$(find ~/data/mmau/CAP-DATA -name "*.mp4" -o -name "*.avi" 2>/dev/null | wc -l)
+if [ "$VIDEO_COUNT" -gt 0 ]; then
+    echo "  Found $VIDEO_COUNT videos already — skipping download."
+else
+    echo "  No videos found — downloading 100GB..."
+    python mmau_adapter/download_partial.py
+fi
 
 echo ""
-echo "[3/4] Preprocessing (frames + YOLO + scene graphs)..."
-python mmau_adapter/preprocess.py --workers 8
+echo "[3/4] Preprocessing (zero-shot scene graphs)..."
+python mmau_adapter/preprocess.py
+
+echo ""
+echo "[3b/4] Analysing scene graphs..."
+python mmau_adapter/analyze_scene_graphs.py
 
 echo ""
 echo "[4/4] Training baseline model (10 epochs)..."
