@@ -1,0 +1,1 @@
+# mmau_adapter package
