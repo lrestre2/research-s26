@@ -112,13 +112,23 @@ class ZeroShotSGG:
         with torch.no_grad():
             outputs = self._gdino_model(**inputs)
 
-        results = self._gdino_proc.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            box_threshold=threshold,
-            text_threshold=threshold,
-            target_sizes=[image.size[::-1]],
-        )[0]
+        # API changed across transformers versions — try both signatures
+        try:
+            results = self._gdino_proc.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                box_threshold=threshold,
+                text_threshold=threshold,
+                target_sizes=[image.size[::-1]],
+            )[0]
+        except TypeError:
+            results = self._gdino_proc.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                threshold,
+                threshold,
+                [image.size[::-1]],
+            )[0]
 
         w, h = image.size
         objects = []
