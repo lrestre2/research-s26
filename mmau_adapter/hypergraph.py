@@ -257,6 +257,177 @@ def build_hypergraph(
     return hg
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# LEARNABLE HYPEREDGE CONSTRUCTION
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Instead of hardcoding rules (objects within 30% of width → spatial edge),
+# we learn which nodes should be grouped into a hyperedge.
+#
+# HOW IT WORKS (plain English):
+#   1. Every node has a feature vector (visual embedding + class + position).
+#   2. A small neural network takes ALL node features and outputs a soft
+#      "membership score" for each node in each potential hyperedge.
+#   3. During training, the network learns which groupings lead to better
+#      accident understanding — the hyperedge structure is discovered from
+#      data, not designed by hand.
+#   4. At inference, we threshold the scores to get hard hyperedges.
+#
+# This is called a "differentiable hypergraph" because the incidence matrix
+# (the matrix that says which nodes belong to which hyperedge) is soft
+# and differentiable during training.
+#
+# Reference: DHGNN (Dynamic Hypergraph Neural Networks, IJCAI 2019)
+# ══════════════════════════════════════════════════════════════════════════
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+
+
+if _TORCH_AVAILABLE:
+
+    class LearnableHyperedgeConstructor(nn.Module):
+        """
+        Learns which nodes should be grouped into hyperedges.
+
+        Input:
+            node_features : Tensor [N, feat_dim]
+                            Features for each of the N nodes in the graph.
+                            Can be visual embeddings, class one-hots,
+                            normalised bbox coords — or all three concatenated.
+
+        Output:
+            H : Tensor [N, K]
+                Soft incidence matrix. H[i, k] is the probability that
+                node i belongs to hyperedge k. Values in [0, 1].
+
+        During training: use H directly (soft, differentiable).
+        At inference:    threshold H > 0.5 to get hard membership.
+
+        Args:
+            feat_dim   : dimension of node feature vectors
+            n_edges    : number of learnable hyperedges K
+            hidden_dim : width of the MLP
+        """
+
+        def __init__(self, feat_dim: int, n_edges: int = 16, hidden_dim: int = 128):
+            super().__init__()
+            self.n_edges = n_edges
+
+            # MLP: node features → membership scores for each hyperedge
+            self.edge_predictor = nn.Sequential(
+                nn.Linear(feat_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, n_edges),
+            )
+
+            # Attention: weight each node's contribution by how "salient" it is
+            self.salience = nn.Sequential(
+                nn.Linear(feat_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+
+        def forward(self, node_features: "torch.Tensor") -> "torch.Tensor":
+            """
+            Args:
+                node_features: [N, feat_dim]
+            Returns:
+                H: [N, K] soft incidence matrix (sigmoid-normalised)
+            """
+            # Predict raw membership logits
+            logits = self.edge_predictor(node_features)   # [N, K]
+
+            # Soft membership via sigmoid (independent per edge)
+            H = torch.sigmoid(logits)                     # [N, K] in (0,1)
+
+            # Zero out edges where no node has strong membership
+            # (removes empty/spurious hyperedges)
+            edge_strength = H.max(dim=0).values           # [K]
+            H = H * (edge_strength > 0.3).float()
+
+            return H
+
+        def to_hard(
+            self,
+            node_features: "torch.Tensor",
+            threshold: float = 0.5,
+        ) -> list[list[int]]:
+            """
+            Returns hard hyperedges as lists of node indices.
+            Useful at inference time.
+
+            Returns:
+                List of K lists, each containing indices of member nodes.
+                Empty lists are removed.
+            """
+            with torch.no_grad():
+                H = self.forward(node_features)             # [N, K]
+                hard = (H > threshold)                      # [N, K] bool
+
+            hyperedges = []
+            for k in range(self.n_edges):
+                members = hard[:, k].nonzero(as_tuple=True)[0].tolist()
+                if len(members) >= 2:
+                    hyperedges.append(members)
+            return hyperedges
+
+
+    def node_features_from_sg(scene_graphs: list[dict], feat_dim: int = 64) -> "torch.Tensor":
+        """
+        Build a simple node feature matrix from a scene graph list.
+        Used to feed into LearnableHyperedgeConstructor.
+
+        Features per node (concatenated):
+          - class one-hot (top 10 classes, dim=10)
+          - normalised bbox centre (x/W, y/H, dim=2)
+          - normalised bbox size (w/W, h/H, dim=2)
+          - frame index normalised (t/T, dim=1)
+          Total: 15 dims. Padded to feat_dim with zeros if needed.
+
+        Returns:
+            Tensor [N, feat_dim]
+        """
+        CLASSES = ["car", "truck", "bus", "motorcycle", "bicycle",
+                   "cyclist", "pedestrian", "person", "traffic light", "other"]
+        cls_idx = {c: i for i, c in enumerate(CLASSES)}
+
+        rows = []
+        T = max(len(scene_graphs), 1)
+
+        for sg in scene_graphs:
+            frame_t = sg.get("frame_idx", 0) / T
+            for obj in sg.get("objects", []):
+                vec = [0.0] * feat_dim
+
+                # class one-hot
+                c = cls_idx.get(obj.get("label", "other"), len(CLASSES) - 1)
+                if c < 10:
+                    vec[c] = 1.0
+
+                # normalised bbox (assume 1280×720 if not known)
+                bbox = obj.get("bbox", [0, 0, 0, 0])
+                vec[10] = (bbox[0] + bbox[2] / 2) / 1280   # cx
+                vec[11] = (bbox[1] + bbox[3] / 2) / 720    # cy
+                vec[12] = bbox[2] / 1280                    # w
+                vec[13] = bbox[3] / 720                     # h
+                vec[14] = frame_t                           # time
+
+                rows.append(vec)
+
+        if not rows:
+            return torch.zeros(1, feat_dim)
+        return torch.tensor(rows, dtype=torch.float32)
+
+
 # ── quick test ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys

@@ -34,10 +34,10 @@ pip install -q \
 
 # Install our adapter's extra dependencies
 pip install -q \
-    ultralytics \
     opencv-python-headless \
     ffmpeg-python \
-    supervision
+    accelerate \
+    bitsandbytes
 
 # ── 4. Create processed data directories ────────────────────────────────
 echo "[3/3] Creating data directories..."
