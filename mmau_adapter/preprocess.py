@@ -32,7 +32,6 @@ import json
 import argparse
 from pathlib import Path
 
-import cv2
 from tqdm import tqdm
 from PIL import Image
 
@@ -41,53 +40,60 @@ from mmau_adapter.scene_graph_gen import ZeroShotSGG
 # ── paths ──────────────────────────────────────────────────────────────
 DATA_DIR   = Path.home() / "data" / "mmau"
 META_FILE  = DATA_DIR / "video_metadata.json"
+# Actual path on disk after extraction (double CAP-DATA from archive structure)
+CAP_DIR    = DATA_DIR / "CAP-DATA" / "CAP-DATA"
 SGRAPH_DIR = DATA_DIR / "processed" / "scene_graphs"
-FRAME_INTERVAL_S = 3.0   # one scene graph every 3 seconds (Hyun's spec)
+N_FRAMES   = 5     # one frame per 3 seconds for a ~15s clip (Hyun's spec)
 
 # Categories we've downloaded
 DOWNLOADED_CATEGORIES = {"11", "43"}
 
 
-def find_video_file(video_name: str) -> Path | None:
-    for ext in [".mp4", ".avi", ".mov", ".mkv"]:
-        for f in DATA_DIR.rglob(f"{video_name}{ext}"):
-            return f
+def find_frame_dir(video_name: str, category: str) -> Path | None:
+    """
+    Find the images/ directory for a given video.
+    Structure: CAP-DATA/CAP-DATA/{category}/{video_name}/images/
+    Also searches recursively in case of slight path variations.
+    """
+    # Direct lookup first (fast)
+    direct = CAP_DIR / category / video_name / "images"
+    if direct.exists():
+        return direct
+
+    # Recursive fallback — search by video_name folder anywhere under CAP_DIR
+    for p in CAP_DIR.rglob(f"{video_name}/images"):
+        return p
+
     return None
 
 
-def extract_frames_at_interval(
-    video_path: Path,
-    t_start: float,
-    t_end: float,
-    interval_s: float = FRAME_INTERVAL_S,
+def load_frames_evenly(
+    frame_dir: Path,
+    n: int = N_FRAMES,
 ) -> list[tuple[int, float, Image.Image]]:
     """
-    Extract one frame every `interval_s` seconds between t_start and t_end.
+    Load n frames evenly spaced from the images/ directory.
     Returns list of (frame_idx, timestamp_s, PIL.Image).
+    Timestamp is estimated assuming 10 fps (DADA dataset standard).
     """
-    cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    duration = max(t_end - t_start, interval_s)
+    jpg_files = sorted(frame_dir.glob("*.jpg"))
+    if not jpg_files:
+        return []
 
-    # Build timestamp list: t_start, t_start+3, t_start+6, ... ≤ t_end
-    timestamps = []
-    t = t_start
-    while t <= t_end + 0.1:
-        timestamps.append(t)
-        t += interval_s
+    # Pick n evenly-spaced indices
+    total = len(jpg_files)
+    indices = [int(i * (total - 1) / (n - 1)) for i in range(n)] if total >= n \
+              else list(range(total))
 
+    FPS = 10.0   # DADA/CAP datasets use 10fps
     frames = []
-    for idx, ts in enumerate(timestamps):
-        frame_num = int(ts * fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        frames.append((idx, round(ts - t_start, 2), img))
+    for out_idx, file_idx in enumerate(indices):
+        f = jpg_files[file_idx]
+        frame_number = int(f.stem)           # filename is the frame number e.g. 000191
+        timestamp_s  = round(frame_number / FPS, 2)
+        img = Image.open(f).convert("RGB")
+        frames.append((out_idx, timestamp_s, img))
 
-    cap.release()
     return frames
 
 
@@ -104,19 +110,14 @@ def process_one(record: dict, sgg: ZeroShotSGG) -> tuple[str, str]:
     if out_path.exists():
         return "skip", vid_id
 
-    # Find video file on disk
-    video_path = find_video_file(vid_name)
-    if video_path is None:
+    # Find the pre-extracted frames directory
+    category = str(record.get("type", ""))
+    frame_dir = find_frame_dir(vid_name, category)
+    if frame_dir is None:
         return "miss", vid_id
 
-    # Accident window timestamps
-    t_ai = float(record.get("t_ai") or 0)
-    t_ae = float(record.get("t_ae") or t_ai + 10)
-    if t_ae <= t_ai:
-        t_ae = t_ai + 10
-
-    # Extract frames at 1 per FRAME_INTERVAL_S
-    frames = extract_frames_at_interval(video_path, t_ai, t_ae)
+    # Load N evenly-spaced frames from the images/ directory
+    frames = load_frames_evenly(frame_dir, n=N_FRAMES)
     if not frames:
         return "fail", vid_id
 
@@ -134,8 +135,8 @@ def process_one(record: dict, sgg: ZeroShotSGG) -> tuple[str, str]:
             "weather": record.get("weather"),
             "light"  : record.get("light"),
             "scenes" : record.get("scenes"),
-            "t_ai"   : t_ai,
-            "t_ae"   : t_ae,
+            "t_ai"   : record.get("t_ai"),
+            "t_ae"   : record.get("t_ae"),
         },
         "scene_graphs": scene_graphs,
     }

@@ -29,11 +29,11 @@ bash scripts/setup_shgvqa.sh
 
 echo ""
 echo "[2/4] Checking data..."
-VIDEO_COUNT=$(find ~/data/mmau/CAP-DATA -name "*.mp4" -o -name "*.avi" 2>/dev/null | wc -l)
-if [ "$VIDEO_COUNT" -gt 0 ]; then
-    echo "  Found $VIDEO_COUNT videos already — skipping download."
+FRAME_COUNT=$(find ~/data/mmau/CAP-DATA -name "*.jpg" 2>/dev/null | wc -l)
+if [ "$FRAME_COUNT" -gt 0 ]; then
+    echo "  Found $FRAME_COUNT frames already — skipping download."
 else
-    echo "  No videos found — downloading 100GB..."
+    echo "  No frames found — downloading 100GB..."
     python mmau_adapter/download_partial.py
 fi
 
