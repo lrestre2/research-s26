@@ -18,6 +18,7 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate srp26
 
 cd "$RESEARCH_DIR"
+export PYTHONPATH="$RESEARCH_DIR:$PYTHONPATH"
 
 echo "========================================"
 echo "  SRP26 Full Pipeline — $(date)"
