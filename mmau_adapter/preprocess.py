@@ -168,7 +168,7 @@ def main():
         records = records[:args.limit]
 
     print(f"Videos to process : {len(records)}")
-    print(f"Frame interval    : {FRAME_INTERVAL_S}s (one scene graph per {FRAME_INTERVAL_S}s)\n")
+    print(f"Frames per video  : {N_FRAMES} (evenly sampled)\n")
 
     # Load models once
     import torch
