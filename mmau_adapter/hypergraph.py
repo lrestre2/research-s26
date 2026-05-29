@@ -173,9 +173,10 @@ def build_hypergraph(
                 node_id   = nid,
                 frame_idx = fi,
                 obj_id    = obj["id"],
-                obj_class = obj["class"],
+                # scene_graph_gen.py uses "label"; some schemas use "class"
+                obj_class = obj.get("label") or obj.get("class", "unknown"),
                 bbox      = obj["bbox"],
-                conf      = obj["conf"],
+                conf      = obj.get("conf", 1.0),
             )
             hg.add_node(node)
             node_map[nid] = node
@@ -426,6 +427,194 @@ if _TORCH_AVAILABLE:
         if not rows:
             return torch.zeros(1, feat_dim)
         return torch.tensor(rows, dtype=torch.float32)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# HYPERGRAPH NEURAL NETWORK (HGNN)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# With the soft incidence matrix H from LearnableHyperedgeConstructor,
+# we can do proper spectral convolution on the hypergraph.
+#
+# The HGNN propagation rule (Feng et al., AAAI 2019):
+#
+#   X' = σ( D_v^{-1/2}  H  W  D_e^{-1}  H^T  D_v^{-1/2}  X  Θ )
+#
+# Where:
+#   H   [N, K]  : incidence matrix (node i ∈ hyperedge k → H[i,k] > 0)
+#   W   [K]     : per-hyperedge importance weights (learnable or uniform)
+#   D_v [N]     : node degree  D_v[i] = Σ_k W[k] * H[i,k]
+#   D_e [K]     : edge degree  D_e[k] = Σ_i H[i,k]
+#   Θ   [d, d'] : learnable linear projection (nn.Linear)
+#
+# Because H is produced by LearnableHyperedgeConstructor (a differentiable
+# MLP), the entire pipeline — from raw node features to classification
+# logits — is end-to-end trainable via backpropagation.
+#
+# SituationHGNN stacks two HypergraphConv layers followed by global mean
+# pooling and a linear classifier:
+#
+#   node_feats [N, d]
+#       → LearnableHyperedgeConstructor → H [N, K]
+#       → HypergraphConv(d → hidden)    → [N, hidden]
+#       → HypergraphConv(hidden → hidden)→ [N, hidden]
+#       → mean over N nodes             → [hidden]
+#       → Linear                        → logits [n_classes]
+# ══════════════════════════════════════════════════════════════════════════
+
+if _TORCH_AVAILABLE:
+
+    class HypergraphConv(nn.Module):
+        """
+        One layer of spectral Hypergraph Neural Network convolution.
+
+        Implements the HGNN update rule from Feng et al. (AAAI 2019):
+
+            X' = σ( D_v^{-1/2} H W D_e^{-1} H^T D_v^{-1/2} X Θ )
+
+        When H is the soft output of LearnableHyperedgeConstructor,
+        gradients flow back through H and the entire pipeline is
+        end-to-end differentiable.
+
+        Args:
+            in_dim  : input feature dimension per node
+            out_dim : output feature dimension per node
+            bias    : include bias in the linear projection Θ
+        """
+
+        def __init__(self, in_dim: int, out_dim: int, bias: bool = True):
+            super().__init__()
+            self.theta = nn.Linear(in_dim, out_dim, bias=bias)
+
+        def forward(
+            self,
+            X: "torch.Tensor",                          # [N, in_dim]
+            H: "torch.Tensor",                          # [N, K]
+            edge_weights: "torch.Tensor | None" = None, # [K]
+        ) -> "torch.Tensor":                            # [N, out_dim]
+            """
+            Args:
+                X            : node feature matrix [N, in_dim]
+                H            : incidence matrix [N, K] — values in (0, 1)
+                edge_weights : per-hyperedge scalar weights [K] (default: 1s)
+            Returns:
+                Updated node features [N, out_dim]
+            """
+            N, K = H.shape
+            W = edge_weights if edge_weights is not None else H.new_ones(K)
+
+            # ── Degree matrices ──────────────────────────────────────────
+            # D_v[i] = Σ_k W[k] * H[i,k]
+            Dv = (H * W.unsqueeze(0)).sum(dim=1).clamp(min=1e-6)  # [N]
+            Dv_inv_sqrt = Dv.pow(-0.5).unsqueeze(1)               # [N, 1]
+
+            # D_e[k] = Σ_i H[i,k]
+            De = H.sum(dim=0).clamp(min=1e-6)                     # [K]
+
+            # ── Propagation ──────────────────────────────────────────────
+            # 1.  D_v^{-1/2} X
+            X_scaled = X * Dv_inv_sqrt                            # [N, in_dim]
+            # 2.  H^T D_v^{-1/2} X
+            HtX = H.t() @ X_scaled                               # [K, in_dim]
+            # 3.  W D_e^{-1} H^T D_v^{-1/2} X
+            WHtX = (W / De).unsqueeze(1) * HtX                   # [K, in_dim]
+            # 4.  H W D_e^{-1} H^T D_v^{-1/2} X
+            agg = H @ WHtX                                        # [N, in_dim]
+            # 5.  D_v^{-1/2} H W D_e^{-1} H^T D_v^{-1/2} X
+            out = agg * Dv_inv_sqrt                               # [N, in_dim]
+
+            return F.relu(self.theta(out))                        # [N, out_dim]
+
+
+    class SituationHGNN(nn.Module):
+        """
+        Full learnable Situation Hypergraph Neural Network for MM-AU.
+
+        This is our main model:
+          1. LearnableHyperedgeConstructor learns which nodes form hyperedges.
+          2. Two HypergraphConv layers do spectral message-passing.
+          3. Global mean pooling collapses the node dimension.
+          4. A linear head maps to accident categories.
+
+        All four steps are differentiable — backprop simultaneously
+        optimises the hyperedge structure AND the classification boundary.
+
+        This directly extends Lohner et al. (IAVVC 2024): they use
+        a fixed pairwise scene graph; we use a learned hypergraph that
+        can encode multi-body interactions (e.g. car + cyclist + truck
+        all involved in the same collision cluster).
+
+        Args:
+            node_feat_dim : dimension of per-node input features
+            hidden_dim    : hidden dimension inside HGNN layers
+            n_classes     : number of accident categories to classify
+            n_edges       : number of learnable hyperedges K
+        """
+
+        def __init__(
+            self,
+            node_feat_dim : int = 64,
+            hidden_dim    : int = 128,
+            n_classes     : int = 58,
+            n_edges       : int = 16,
+        ):
+            super().__init__()
+            self.hyperedge_ctor = LearnableHyperedgeConstructor(
+                feat_dim=node_feat_dim,
+                n_edges=n_edges,
+                hidden_dim=hidden_dim,
+            )
+            self.conv1 = HypergraphConv(node_feat_dim, hidden_dim)
+            self.conv2 = HypergraphConv(hidden_dim, hidden_dim)
+            self.drop  = nn.Dropout(0.3)
+            self.head  = nn.Linear(hidden_dim, n_classes)
+
+        def forward(
+            self,
+            node_features: "torch.Tensor",  # [N, node_feat_dim]
+        ) -> "torch.Tensor":                # [n_classes]
+            """
+            Single-sample forward (no batch dimension — N varies per video).
+            Call in a loop over the batch; see HGNNQAModel in run_baseline.py
+            for the batched wrapper.
+
+            Returns raw logits [n_classes].
+            """
+            H  = self.hyperedge_ctor(node_features)  # [N, K]  soft incidence matrix
+            x  = self.conv1(node_features, H)         # [N, hidden]
+            x  = self.conv2(x, H)                     # [N, hidden]
+            x  = self.drop(x.mean(dim=0))             # [hidden] — graph-level embedding
+            return self.head(x)                       # [n_classes]
+
+        def graph_embedding(
+            self,
+            node_features: "torch.Tensor",  # [N, node_feat_dim]
+        ) -> "torch.Tensor":                # [hidden_dim]
+            """Return the graph-level embedding (before the classification head).
+            Useful for downstream tasks or feature inspection."""
+            with torch.no_grad():
+                H = self.hyperedge_ctor(node_features)
+                x = self.conv1(node_features, H)
+                x = self.conv2(x, H)
+                return x.mean(dim=0)
+
+        def get_hyperedges(
+            self,
+            node_features: "torch.Tensor",
+            threshold: float = 0.5,
+        ) -> "tuple[torch.Tensor, list[list[int]]]":
+            """
+            Return (soft H matrix, hard hyperedge lists) for demo / analysis.
+
+            Returns:
+                H         : [N, K] soft incidence matrix
+                hard_edges: list of K lists, each containing member node indices.
+                            Empty hyperedges are removed.
+            """
+            with torch.no_grad():
+                H = self.hyperedge_ctor(node_features)
+            hard_edges = self.hyperedge_ctor.to_hard(node_features, threshold)
+            return H, hard_edges
 
 
 # ── quick test ───────────────────────────────────────────────────────────

@@ -41,7 +41,11 @@ SHGVQA_DIR   = RESEARCH_DIR / "SHG-VQA" / "AGQA"
 sys.path.insert(0, str(SHGVQA_DIR))
 
 from mmau_adapter.dataset import MMAUDataset, collate_fn
-from mmau_adapter.hypergraph import build_hypergraph
+from mmau_adapter.hypergraph import (
+    build_hypergraph,
+    SituationHGNN,
+    node_features_from_sg,
+)
 
 # ── config ─────────────────────────────────────────────────────────────
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
@@ -116,6 +120,117 @@ class LightHGQA(nn.Module):
         return self.classifier(x)
 
 
+# ── upgraded model: multimodal HGNN ─────────────────────────────────────
+#
+# HGNNQAModel replaces LightHGQA as the main model.
+# The key difference: instead of a scalar node-count feature, we pass all
+# node features through SituationHGNN, which does two rounds of spectral
+# hypergraph convolution over a *learned* incidence matrix H.
+#
+# Concretely, for each sample in the batch we:
+#   1. Build node feature matrix X from the scene graph (CPU, fast).
+#   2. Run SituationHGNN(X):
+#        - LearnableHyperedgeConstructor → H [N, K]
+#        - HypergraphConv × 2           → [N, hidden]
+#        - mean pool                    → [hidden]
+#   3. Concatenate with visual (MobileNetV3) and text (BERT) features.
+#   4. Classify with a 2-layer MLP.
+#
+# The HGNN introduces ~500k additional parameters on top of LightHGQA
+# but provides a richer, structured representation of the accident scene.
+
+class HGNNQAModel(nn.Module):
+    """
+    Multimodal accident classifier with a learnable situation hypergraph.
+
+    Modalities:
+        visual : MobileNetV3-small, mean-pooled over T keyframes
+        text   : BERT [CLS] token for the question
+        graph  : SituationHGNN over the scene graph node features
+
+    Args:
+        n_answers     : size of the answer vocabulary
+        node_feat_dim : dimension of per-node features fed to the HGNN (default 64)
+        hidden        : shared hidden dimension for all projection heads
+        n_hg_edges    : number of learnable hyperedges K
+    """
+
+    def __init__(
+        self,
+        n_answers     : int,
+        node_feat_dim : int = 64,
+        hidden        : int = 256,
+        n_hg_edges    : int = 16,
+    ):
+        super().__init__()
+
+        # ── Visual encoder (frozen MobileNetV3-small) ────────────────────
+        import torchvision.models as M
+        backbone  = M.mobilenet_v3_small(weights=M.MobileNet_V3_Small_Weights.DEFAULT)
+        self.vis  = nn.Sequential(*list(backbone.children())[:-1])
+        vis_dim   = 576
+        self.vis_proj = nn.Linear(vis_dim, hidden)
+
+        # ── Text encoder (BERT) ──────────────────────────────────────────
+        from transformers import BertModel
+        self.bert      = BertModel.from_pretrained("bert-base-uncased")
+        self.bert_proj = nn.Linear(768, hidden)
+
+        # ── Situation Hypergraph Neural Network ──────────────────────────
+        self.hgnn = SituationHGNN(
+            node_feat_dim=node_feat_dim,
+            hidden_dim=hidden,
+            n_classes=hidden,      # output is an embedding, not logits here
+            n_edges=n_hg_edges,
+        )
+        # Override the HGNN head so it outputs an embedding vector
+        self.hgnn.head = nn.Identity()   # pooled [hidden] passes straight through
+
+        # ── Fusion + classifier ──────────────────────────────────────────
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden * 3, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden, n_answers),
+        )
+
+    def forward(
+        self,
+        frames        : "torch.Tensor",      # [B, T, C, H, W]
+        input_ids     : "torch.Tensor",      # [B, seq_len]
+        attention_mask: "torch.Tensor",      # [B, seq_len]
+        scene_graphs  : "list[list[dict]]",  # B scene graph dicts (variable N)
+    ) -> "torch.Tensor":                     # [B, n_answers]
+
+        B, T, C, H, W = frames.shape
+
+        # ── Visual features ──────────────────────────────────────────────
+        vis_out  = self.vis(frames.view(B * T, C, H, W))      # [B*T, 576, 1, 1]
+        vis_feat = vis_out.view(B, T, -1).mean(dim=1)         # [B, 576]
+        vis_feat = self.vis_proj(vis_feat)                     # [B, hidden]
+
+        # ── Text features ────────────────────────────────────────────────
+        bert_out  = self.bert(input_ids=input_ids,
+                              attention_mask=attention_mask)
+        txt_feat  = self.bert_proj(
+            bert_out.last_hidden_state[:, 0])                 # [B, hidden]
+
+        # ── Hypergraph features (variable-size, process one-by-one) ─────
+        hg_feats = []
+        for sg in scene_graphs:
+            node_feats = node_features_from_sg(
+                sg if isinstance(sg, list) else sg.get("scene_graphs", []),
+                feat_dim=64,
+            ).to(frames.device)                               # [N, 64]
+            emb = self.hgnn(node_feats)                       # [hidden]
+            hg_feats.append(emb)
+        hg_feat = torch.stack(hg_feats)                       # [B, hidden]
+
+        # ── Fuse modalities and classify ─────────────────────────────────
+        fused = torch.cat([vis_feat, txt_feat, hg_feat], dim=-1)  # [B, hidden*3]
+        return self.classifier(fused)                         # [B, n_answers]
+
+
 # ── helpers ─────────────────────────────────────────────────────────────
 
 def build_answer_vocab(records):
@@ -186,6 +301,8 @@ def main():
     parser.add_argument("--batch",     type=int,   default=8)
     parser.add_argument("--lr",        type=float, default=1e-4)
     parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--baseline",  action="store_true",
+                        help="Use LightHGQA (scalar node-count) instead of HGNNQAModel")
     args = parser.parse_args()
 
     RUN_DIR.mkdir(parents=True, exist_ok=True)
@@ -218,8 +335,13 @@ def main():
     test_loader  = DataLoader(test_ds,  batch_size=args.batch,
                               shuffle=False, collate_fn=collate_fn, num_workers=4)
 
-    # Model
-    model     = LightHGQA(n_answers=n_answers).to(DEVICE)
+    # Model — HGNNQAModel by default, LightHGQA with --baseline flag
+    if args.baseline:
+        print("Model: LightHGQA (scalar node-count baseline)")
+        model = LightHGQA(n_answers=n_answers).to(DEVICE)
+    else:
+        print("Model: HGNNQAModel (learnable situation hypergraph)")
+        model = HGNNQAModel(n_answers=n_answers).to(DEVICE)
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
@@ -261,12 +383,15 @@ def main():
                             padding=True, truncation=True, max_length=32)
             input_ids      = enc["input_ids"].to(DEVICE)
             attention_mask = enc["attention_mask"].to(DEVICE)
-            sg_counts      = torch.tensor([get_sg_node_count(sg) for sg in sgs],
-                                          device=DEVICE)
 
             optimizer.zero_grad()
-            logits = model(frames, input_ids, attention_mask, sg_counts)
-            loss   = criterion(logits, labels)
+            if args.baseline:
+                sg_counts = torch.tensor([get_sg_node_count(sg) for sg in sgs],
+                                         device=DEVICE)
+                logits = model(frames, input_ids, attention_mask, sg_counts)
+            else:
+                logits = model(frames, input_ids, attention_mask, sgs)
+            loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
