@@ -242,56 +242,17 @@ def build_hypergraph(
                                  "frames": [fi, fi1]},
                 ))
 
-    # ── 4. COLLISION hyperedges — LLaVA-grounded only ────────────────────
+    # NOTE: No collision hyperedges are constructed here.
     #
-    # We only create a collision hyperedge when LLaVA explicitly said so.
-    # This is still imperfect (LLaVA can hallucinate) but is far more
-    # reliable than a 2D bbox-IoU threshold, which fires constantly due
-    # to perspective projection.
+    # Neither bbox IoU (unreliable in 2D due to perspective) nor LLaVA
+    # predicates (zero-shot, hallucinates on close objects) are trustworthy
+    # enough to label a collision.
     #
-    # The canonical collision groupings come from SituationHGNN training.
-    # These LLaVA-grounded edges serve as a weak initialisation signal.
-
-    COLLISION_PREDICATES = {
-        "colliding_with", "cutting_off", "hitting", "crashing_into",
-    }
-
-    for frame in scene_graph:
-        fi = frame.get("frame_idx", 0)
-        obj_by_id = {o["id"]: o for o in frame.get("objects", [])}
-
-        for rel in frame.get("relations", []):
-            if rel.get("source") != "llava":
-                continue
-            if rel.get("predicate", "") not in COLLISION_PREDICATES:
-                continue
-
-            s_id = rel.get("subject")
-            o_id = rel.get("object")
-            if s_id not in obj_by_id or o_id not in obj_by_id:
-                continue
-
-            s_nid = f"{video_id}_f{fi:02d}_o{s_id}"
-            o_nid = f"{video_id}_f{fi:02d}_o{o_id}"
-            if s_nid not in node_map or o_nid not in node_map:
-                continue
-
-            eid = f"{video_id}_collision_{edge_counter}"
-            edge_counter += 1
-            hg.add_edge(Hyperedge(
-                edge_id   = eid,
-                edge_type = "collision",
-                node_ids  = [s_nid, o_nid],
-                metadata  = {
-                    "predicate" : rel["predicate"],
-                    "frame_idx" : fi,
-                    "source"    : "llava",
-                    "classes"   : [
-                        obj_by_id[s_id].get("label", "?"),
-                        obj_by_id[o_id].get("label", "?"),
-                    ],
-                },
-            ))
+    # Collision groupings are learned by SituationHGNN from accident
+    # category labels during training. After enough examples, the
+    # LearnableHyperedgeConstructor learns to put the causally-involved
+    # objects into the same hyperedge — without ever being told explicitly
+    # what a collision looks like. That is the contribution.
 
     return hg
 

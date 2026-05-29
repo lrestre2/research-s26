@@ -167,7 +167,11 @@ def annotate_frame(
         draw.rectangle(bbox_txt, fill=rgb)
         draw.text((x1, y1 - 16), label, fill="white", font=font)
 
-    # Draw LLaVA semantic relations as arrows
+    # Draw LLaVA semantic relations as arrows.
+    # These are zero-shot VLM predictions — shown for reference only.
+    # Collision predicates are highlighted in orange to signal they are
+    # unverified; true collision groupings are learned by the HGNN.
+    COLLISION_PREDS = {"colliding_with", "hitting", "cutting_off", "crashing_into"}
     for rel in frame_data.get("relations", []):
         if rel.get("source") != "llava":
             continue
@@ -180,8 +184,12 @@ def annotate_frame(
         ox, oy = centres[o_id]
         mid_x, mid_y = (sx + ox) / 2, (sy + oy) / 2
 
-        draw.line([(sx, sy), (ox, oy)], fill="white", width=2)
-        # Draw arrowhead
+        # Collision predicates drawn in orange + marked as LLaVA-only
+        is_collision = pred in COLLISION_PREDS
+        line_color   = (255, 165, 0) if is_collision else (255, 255, 255)
+        text_color   = (255, 165, 0) if is_collision else (255, 255, 0)
+
+        draw.line([(sx, sy), (ox, oy)], fill=line_color, width=2)
         dx, dy = ox - sx, oy - sy
         ln = max((dx**2 + dy**2)**0.5, 1)
         ax = ox - 10 * dx / ln
@@ -190,11 +198,12 @@ def annotate_frame(
             [(ox, oy),
              (ax + 5 * dy / ln, ay - 5 * dx / ln),
              (ax - 5 * dy / ln, ay + 5 * dx / ln)],
-            fill="white",
+            fill=line_color,
         )
-        # Predicate label
         short = pred.replace("_", " ")
-        draw.text((mid_x + 4, mid_y - 8), short, fill="yellow", font=small_font)
+        suffix = " (?)" if is_collision else ""
+        draw.text((mid_x + 4, mid_y - 8), short + suffix,
+                  fill=text_color, font=small_font)
 
     # Timestamp watermark
     draw.text((8, 8),
