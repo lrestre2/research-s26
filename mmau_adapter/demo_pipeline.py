@@ -115,7 +115,7 @@ def print_scene_graph(video_id: str, scene_graphs: list[dict]):
 
 
 def print_rule_based_hypergraph(hg):
-    section("STEP 2 — RULE-BASED HYPERGRAPH  (baseline, for comparison)")
+    section("STEP 2 — RULE-BASED HYPERGRAPH  (spatial + temporal only)")
     type_counts = Counter(e.edge_type for e in hg.hyperedges)
     print(f"\n  Nodes      : {len(hg.nodes)}")
     print(f"  Hyperedges : {len(hg.hyperedges)}")
@@ -130,9 +130,11 @@ def print_rule_based_hypergraph(hg):
             print(f"    [{e.edge_type:<12}]  nodes={e.node_ids}  {meta_str}")
 
     print()
-    print("  Limitation: thresholds are hand-tuned (0.3 × frame width for")
-    print("  spatial, IoU > 0.4 for temporal). Multi-body groups require")
-    print("  multiple pairwise edges — cannot be represented as one hyperedge.")
+    print("  Why no rule-based collision edges?")
+    print("  Bounding-box overlap in 2D is unreliable: objects overlap in")
+    print("  the image due to perspective without actually colliding.")
+    print("  → Collision groupings are what the HGNN learns from data.")
+    print("    That is the contribution. Rule-based would be wrong here.")
 
 
 def print_learnable_hypergraph(scene_graphs: list[dict]):
@@ -228,15 +230,18 @@ def print_pipeline_summary():
     print("  ① Grounding DINO  →  objects + bounding boxes  (zero-shot detection)")
     print("  ② LLaVA-1.5-7B   →  semantic relations         (zero-shot VQA)")
     print("                          ↓")
-    print("  ③ LearnableHyperedgeConstructor")
-    print("        node features [N×64] → soft incidence matrix H [N×K]")
-    print("        H is a differentiable MLP output — trained end-to-end")
+    print("  ③ Rule-based edges: SPATIAL (proximity) + TEMPORAL (tracking)")
+    print("     ✗ Collision edges are NOT hardcoded — bbox IoU is wrong in 2D")
     print("                          ↓")
-    print("  ④ HypergraphConv × 2")
+    print("  ④ LearnableHyperedgeConstructor")
+    print("        node features [N×64] → soft incidence matrix H [N×K]")
+    print("        H learned from accident labels — discovers collision groupings")
+    print("                          ↓")
+    print("  ⑤ HypergraphConv × 2")
     print("        spectral message passing: X' = Dv^(-½) H W De^(-1) Hᵀ Dv^(-½) X Θ")
     print("        nodes aggregate from ALL members of each hyperedge at once")
     print("                          ↓")
-    print("  ⑤ Mean pool → Linear → accident category (58 classes, MM-AU)")
+    print("  ⑥ Mean pool → Linear → accident category (58 classes, MM-AU)")
     print()
     print("  Comparison with prior work:")
     print(f"  {'Method':<35} {'Graph type':<20} {'Categories':<12} {'SGG'}")
