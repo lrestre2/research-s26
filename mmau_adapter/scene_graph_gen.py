@@ -87,10 +87,12 @@ class ZeroShotSGG:
         self._gdino_model.eval()
 
         if not self.spatial_only:
-            from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
+            # llava-1.5-7b-hf is LLaVA 1.5 — use LlavaProcessor / LlavaForConditionalGeneration.
+            # LlavaNextProcessor (1.6) chokes on this checkpoint with KeyError: 'image_sizes'.
+            from transformers import LlavaProcessor, LlavaForConditionalGeneration
             print("  Loading LLaVA-1.5-7B ...")
-            self._llava_proc  = LlavaNextProcessor.from_pretrained(LLAVA_MODEL)
-            self._llava_model = LlavaNextForConditionalGeneration.from_pretrained(
+            self._llava_proc  = LlavaProcessor.from_pretrained(LLAVA_MODEL)
+            self._llava_model = LlavaForConditionalGeneration.from_pretrained(
                 LLAVA_MODEL,
                 torch_dtype=torch.float16,
                 low_cpu_mem_usage=True,
@@ -189,8 +191,9 @@ class ZeroShotSGG:
             for o in objects
         )
 
+        # LLaVA 1.5 prompt format: USER: <image>\n{text}\nASSISTANT:
         prompt = (
-            "[INST] <image>\n"
+            "USER: <image>\n"
             "You are analyzing a traffic dashcam frame from an accident video.\n"
             "The following objects were detected:\n"
             f"{obj_list}\n\n"
@@ -200,7 +203,7 @@ class ZeroShotSGG:
             "crossing_path_of, blocking, stopped_in_front_of.\n\n"
             "Respond ONLY with a JSON list, no other text. Example:\n"
             '[{"subject": 0, "predicate": "approaching", "object": 1}]\n'
-            "[/INST]"
+            "ASSISTANT:"
         )
 
         inputs = self._llava_proc(
@@ -216,7 +219,7 @@ class ZeroShotSGG:
                 do_sample=False,
             )
 
-        response = self._llava_proc.decode(
+        response = self._llava_proc.tokenizer.decode(
             output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
         ).strip()
 
