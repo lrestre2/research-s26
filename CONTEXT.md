@@ -255,3 +255,53 @@ research-s26/
     ├── run_pipeline.sh              ← Master pipeline (run overnight)
     └── inspect_hf_repo.py           ← HuggingFace repo explorer (one-off tool)
 ```
+
+## Training results
+```
+
+(srp26)  🐍 srp26  trinity@trinity-gpulab  ~/Liu/research-s26  ↱ main  tail -f ~/training.log
+
+cls.predictions.transform.LayerNorm.weight | UNEXPECTED |  | 
+cls.predictions.transform.dense.bias       | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.bias   | UNEXPECTED |  | 
+cls.seq_relationship.bias                  | UNEXPECTED |  | 
+cls.predictions.bias                       | UNEXPECTED |  | 
+cls.seq_relationship.weight                | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:   can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+Epoch 1/10: 100%|██████████| 270/270 [00:16<00:00, 16.45it/s]
+Epoch 01 | loss 0.4385 | train acc 0.820 | val acc 0.842
+  ↑ New best: 0.842
+Epoch 2/10: 100%|██████████| 270/270 [00:15<00:00, 17.61it/s]
+Epoch 02 | loss 0.3251 | train acc 0.858 | val acc 0.864
+  ↑ New best: 0.864
+Epoch 3/10: 100%|██████████| 270/270 [00:15<00:00, 17.33it/s]
+Epoch 03 | loss 0.2290 | train acc 0.901 | val acc 0.877
+  ↑ New best: 0.877
+Epoch 4/10: 100%|██████████| 270/270 [00:15<00:00, 17.18it/s]
+Epoch 04 | loss 0.1686 | train acc 0.931 | val acc 0.875
+Epoch 5/10: 100%|██████████| 270/270 [00:15<00:00, 17.40it/s]
+Epoch 05 | loss 0.1255 | train acc 0.951 | val acc 0.883
+  ↑ New best: 0.883
+Epoch 6/10: 100%|██████████| 270/270 [00:15<00:00, 17.73it/s]
+Epoch 06 | loss 0.0798 | train acc 0.972 | val acc 0.890
+  ↑ New best: 0.890
+Epoch 7/10: 100%|██████████| 270/270 [00:14<00:00, 18.06it/s]
+Epoch 07 | loss 0.0681 | train acc 0.975 | val acc 0.894
+  ↑ New best: 0.894
+Epoch 8/10: 100%|██████████| 270/270 [00:15<00:00, 17.24it/s]
+Epoch 08 | loss 0.0616 | train acc 0.978 | val acc 0.870
+Epoch 9/10: 100%|██████████| 270/270 [00:15<00:00, 17.11it/s]
+Epoch 09 | loss 0.0405 | train acc 0.989 | val acc 0.914
+  ↑ New best: 0.914
+Epoch 10/10: 100%|██████████| 270/270 [00:15<00:00, 17.68it/s]
+Epoch 10 | loss 0.0457 | train acc 0.985 | val acc 0.862
+
+=== Test Set Evaluation ===
+Test accuracy: 0.8423 (84.23%)                       
+(Task: simple_scene vs complex_scene — random baseline = 50%)
+
+Results saved → /home/trinity/Liu/research-s26/runs/mmau_baseline/results.json
+[1]  + 2169398 done       nohup env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python  --epochs 10 --batch 8 >
+```
