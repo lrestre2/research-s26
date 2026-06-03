@@ -1,12 +1,27 @@
 """
-MM-AU Dataset class — SHG-VQA compatible
-==========================================
-Reads MM-AU metadata + preprocessed scene graphs and returns
-(frames_tensor, scene_graph_dict, question, answer_label) tuples
-that the SHG-VQA model can consume directly.
+MM-AU Dataset class — driven by scene graph JSONs
+==================================================
+Loads directly from the preprocessed scene graph JSONs in
+~/data/mmau/processed/scene_graphs/ and the original JPEG frames
+in ~/data/mmau/CAP-DATA/CAP-DATA/.
 
-This is the "bridge" file — it speaks MM-AU on one side and SHG-VQA
-on the other. If you change the preprocessing format, change it here.
+Does NOT depend on video_metadata.json matching folder names —
+that mapping was broken. Everything comes from the JSONs we generated.
+
+Classification task
+-------------------
+With only category 11 on disk we can't do category classification
+(only one class → model learns nothing). Instead we use a binary
+label derived from the scene graphs themselves:
+
+  label 1 — "complex scene": the video has >= 3 unique object
+             classes detected across its frames (e.g. car + cyclist
+             + pedestrian). These tend to be more dangerous scenarios.
+  label 0 — "simple scene":  fewer than 3 unique object classes.
+
+This gives a real, balanced, meaningful training signal without
+needing external metadata. Once category 43 is preprocessed, swap
+`_make_label` to return the accident category instead.
 
 Usage:
     from mmau_adapter.dataset import MMAUDataset
@@ -24,22 +39,14 @@ from torchvision import transforms
 from PIL import Image
 
 # ── paths ──────────────────────────────────────────────────────────────
-DATA_DIR      = Path.home() / "data" / "mmau"
-META_FILE     = DATA_DIR / "video_metadata.json"
-FRAMES_DIR    = DATA_DIR / "processed" / "frames"
-SGRAPH_DIR    = DATA_DIR / "processed" / "scene_graphs"
+DATA_DIR   = Path.home() / "data" / "mmau"
+CAP_DIR    = DATA_DIR / "CAP-DATA" / "CAP-DATA"
+SGRAPH_DIR = DATA_DIR / "processed" / "scene_graphs"
 
 # ── constants ─────────────────────────────────────────────────────────
-N_FRAMES   = 16
-IMG_SIZE   = 224      # SHG-VQA default input resolution
-CATEGORIES = list(range(1, 59))   # accident categories 1–58
+N_FRAMES  = 5        # matches what preprocess.py sampled
+IMG_SIZE  = 224      # standard input size for vision models
 
-# MM-AU object classes (7 annotated classes)
-OBJECT_CLASSES = ["car", "traffic light", "pedestrian", "truck",
-                  "bus", "cyclist", "motorbike"]
-CLASS_TO_IDX = {c: i for i, c in enumerate(OBJECT_CLASSES)}
-
-# Frame transform: resize and normalise to ImageNet stats
 FRAME_TRANSFORM = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
@@ -48,125 +55,162 @@ FRAME_TRANSFORM = transforms.Compose([
 ])
 
 
+# ── label logic ───────────────────────────────────────────────────────
+
+def _make_label(data: dict) -> tuple[str, int]:
+    """
+    Derive a binary label from the scene graph content.
+
+    Returns (answer_str, int_label) where:
+      "complex_scene" / 1 → >= 3 unique object classes detected
+      "simple_scene"  / 0 → < 3 unique object classes detected
+
+    Swap this function out once category 43 is on disk and you
+    want to do category classification instead.
+    """
+    classes = set()
+    for sg in data.get("scene_graphs", []):
+        for obj in sg.get("objects", []):
+            label = obj.get("label") or obj.get("class", "")
+            if label:
+                classes.add(label.lower())
+    is_complex = len(classes) >= 3
+    return ("complex_scene" if is_complex else "simple_scene",
+            1 if is_complex else 0)
+
+
+# ── dataset ───────────────────────────────────────────────────────────
+
 class MMAUDataset(Dataset):
     """
-    Each sample corresponds to one accident video.
+    Each sample is one accident video.
 
     Returns a dict with:
-        frames      : Tensor [N_FRAMES, 3, H, W]  — the 16 keyframes
-        scene_graph : dict   — per-frame objects + relations
-        question    : str    — "Why did the accident happen?"
-        answer      : str    — the accident cause text
-        category    : int    — accident type (1–58)
-        video_id    : str    — unique video identifier
+        frames      : Tensor [N_FRAMES, 3, 224, 224]
+        scene_graph : list[dict]  — per-frame objects + relations
+        question    : str         — fixed question
+        answer      : str         — "complex_scene" or "simple_scene"
+        label       : int         — 0 or 1
+        category    : int         — accident category from JSON
+        video_id    : str
     """
 
     def __init__(
         self,
         split       : Literal["train", "val", "test"] = "train",
-        categories  : list[int] | None = None,   # None = all downloaded
+        categories  : list[int] | None = None,
         max_samples : int | None = None,
     ):
         self.split = split
 
-        # Load metadata
-        with open(META_FILE) as f:
-            raw = json.load(f)
-        all_records = raw if isinstance(raw, list) else list(raw.values())
+        # ── Load all scene graph JSONs ───────────────────────────────
+        all_data = []
+        for jp in sorted(SGRAPH_DIR.glob("*.json")):
+            try:
+                d = json.loads(jp.read_text())
+                if isinstance(d, dict) and "scene_graphs" in d:
+                    all_data.append(d)
+            except Exception:
+                continue
 
-        # Keep only records that have been preprocessed
-        all_records = [
-            r for r in all_records
-            if (SGRAPH_DIR / f"{self._vid_id(r)}.json").exists()
-        ]
-
-        # Filter to requested categories
+        # ── Filter by category if requested ─────────────────────────
         if categories is not None:
-            all_records = [r for r in all_records
-                           if int(r.get("type", 0)) in categories]
+            all_data = [d for d in all_data
+                        if d.get("category") in categories]
 
-        # Train / val / test split — 7 : 1.5 : 1.5 ratio by index
-        n = len(all_records)
+        # ── Train / val / test split (70 / 15 / 15) ─────────────────
+        n     = len(all_data)
         t_end = int(n * 0.70)
         v_end = int(n * 0.85)
         if split == "train":
-            self.records = all_records[:t_end]
+            self.data = all_data[:t_end]
         elif split == "val":
-            self.records = all_records[t_end:v_end]
+            self.data = all_data[t_end:v_end]
         else:
-            self.records = all_records[v_end:]
+            self.data = all_data[v_end:]
 
         if max_samples:
-            self.records = self.records[:max_samples]
+            self.data = self.data[:max_samples]
 
-    @staticmethod
-    def _vid_id(record: dict) -> str:
-        return record.get("video_hashcode") or record.get("video_name", "unknown")
+        # ── Build frame directory cache (scan CAP_DIR once) ─────────
+        # Maps video_id (folder name) → Path of images/ directory
+        self._frame_cache: dict[str, Path] = {}
+        for p in CAP_DIR.rglob("images"):
+            if p.is_dir():
+                self._frame_cache[p.parent.name] = p
 
-    def __len__(self):
-        return len(self.records)
+        print(f"  [{split}] {len(self.data)} samples | "
+              f"{len(self._frame_cache)} frame dirs indexed")
+
+    def __len__(self) -> int:
+        return len(self.data)
 
     def __getitem__(self, idx: int) -> dict:
-        record  = self.records[idx]
-        vid_id  = self._vid_id(record)
+        d        = self.data[idx]
+        video_id = d.get("video_id", "unknown")
 
-        # ── frames ──────────────────────────────────────────────────────
-        frame_dir = FRAMES_DIR / vid_id
+        # ── Load frames from original JPEG directory ─────────────────
+        frame_dir     = self._frame_cache.get(video_id)
         frame_tensors = []
-        for fi in range(N_FRAMES):
-            fp = frame_dir / f"frame_{fi:04d}.jpg"
-            if fp.exists():
-                img = Image.open(fp).convert("RGB")
-                frame_tensors.append(FRAME_TRANSFORM(img))
+
+        if frame_dir and frame_dir.exists():
+            jpgs  = sorted(frame_dir.glob("*.jpg"))
+            total = len(jpgs)
+            if total >= N_FRAMES:
+                idxs = [int(i * (total - 1) / (N_FRAMES - 1))
+                        for i in range(N_FRAMES)]
             else:
-                frame_tensors.append(torch.zeros(3, IMG_SIZE, IMG_SIZE))
-        frames = torch.stack(frame_tensors)           # [16, 3, 224, 224]
+                idxs = list(range(total))
 
-        # ── scene graph ─────────────────────────────────────────────────
-        sg_path = SGRAPH_DIR / f"{vid_id}.json"
-        scene_graph = json.loads(sg_path.read_text()) if sg_path.exists() else []
+            for i in range(N_FRAMES):
+                if i < len(idxs):
+                    try:
+                        img = Image.open(jpgs[idxs[i]]).convert("RGB")
+                        frame_tensors.append(FRAME_TRANSFORM(img))
+                    except Exception:
+                        frame_tensors.append(torch.zeros(3, IMG_SIZE, IMG_SIZE))
+                else:
+                    frame_tensors.append(torch.zeros(3, IMG_SIZE, IMG_SIZE))
+        else:
+            frame_tensors = [torch.zeros(3, IMG_SIZE, IMG_SIZE)] * N_FRAMES
 
-        # ── question & answer ────────────────────────────────────────────
-        # MM-AU stores the accident reason in the "causes" field.
-        # We frame this as a fixed question with the cause as the answer.
-        question = "Why did the accident happen?"
-        answer   = record.get("causes") or record.get("texts") or "unknown"
+        frames = torch.stack(frame_tensors)   # [N_FRAMES, 3, 224, 224]
 
-        # ── category ────────────────────────────────────────────────────
-        category = int(record.get("type", 0))
+        # ── Label ────────────────────────────────────────────────────
+        answer, label = _make_label(d)
 
         return {
             "frames"      : frames,
-            "scene_graph" : scene_graph,
-            "question"    : question,
+            "scene_graph" : d.get("scene_graphs", []),
+            "question"    : "How complex is this accident scene?",
             "answer"      : answer,
-            "category"    : category,
-            "video_id"    : vid_id,
+            "label"       : label,
+            "category"    : d.get("category", 0),
+            "video_id"    : video_id,
         }
 
 
 def collate_fn(batch: list[dict]) -> dict:
-    """
-    Custom collate: stack tensors, keep text/graph as lists.
-    Pass this to DataLoader as collate_fn=collate_fn.
-    """
     return {
         "frames"      : torch.stack([b["frames"] for b in batch]),
         "scene_graph" : [b["scene_graph"] for b in batch],
         "question"    : [b["question"] for b in batch],
         "answer"      : [b["answer"] for b in batch],
+        "label"       : torch.tensor([b["label"] for b in batch]),
         "category"    : torch.tensor([b["category"] for b in batch]),
         "video_id"    : [b["video_id"] for b in batch],
     }
 
 
 if __name__ == "__main__":
-    ds = MMAUDataset(split="train", max_samples=5)
-    print(f"Train samples: {len(ds)}")
+    print("Loading dataset...")
+    ds = MMAUDataset(split="train", max_samples=10)
+    print(f"Samples : {len(ds)}")
     if len(ds):
         s = ds[0]
+        print(f"  video_id     : {s['video_id']}")
         print(f"  frames shape : {s['frames'].shape}")
-        print(f"  category     : {s['category']}")
-        print(f"  question     : {s['question']}")
-        print(f"  answer       : {s['answer'][:80]}...")
-        print(f"  scene graph  : {len(s['scene_graph'])} frames")
+        print(f"  scene graphs : {len(s['scene_graph'])} frames")
+        print(f"  answer/label : {s['answer']} ({s['label']})")
+        n_real = (s['frames'].sum(dim=(1,2,3)) != 0).sum().item()
+        print(f"  real frames  : {n_real}/{len(s['frames'])} (others = black)")
