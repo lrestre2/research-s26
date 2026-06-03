@@ -248,6 +248,35 @@ def get_sg_node_count(scene_graph: list[dict]) -> int:
     return sum(len(f.get("objects", [])) for f in scene_graph)
 
 
+def _evaluate(model, loader, tokenizer, args, device) -> float:
+    """Run one pass over loader, return accuracy (0–1)."""
+    model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Eval", leave=False):
+            frames    = batch["frames"].to(device)
+            questions = batch["question"]
+            labels    = batch["label"].to(device)
+            sgs       = batch["scene_graph"]
+
+            enc = tokenizer(questions, return_tensors="pt",
+                            padding=True, truncation=True, max_length=32)
+            input_ids      = enc["input_ids"].to(device)
+            attention_mask = enc["attention_mask"].to(device)
+
+            if args.baseline:
+                sg_counts = torch.tensor([get_sg_node_count(sg) for sg in sgs],
+                                         device=device)
+                logits = model(frames, input_ids, attention_mask, sg_counts)
+            else:
+                logits = model(frames, input_ids, attention_mask, sgs)
+
+            correct += (logits.argmax(1) == labels).sum().item()
+            total   += labels.size(0)
+    model.train()
+    return correct / total if total else 0.0
+
+
 def evaluate(model, loader, answer_vocab, device):
     """Return overall accuracy and per-category accuracy dict."""
     model.eval()
@@ -320,13 +349,9 @@ def main():
         print("No preprocessed data found. Run preprocess.py first.")
         return
 
-    # Build answer vocabulary from train set
-    answer_vocab = build_answer_vocab(
-        [train_ds.records[i] for i in range(len(train_ds))]
-    )
-    n_answers = len(answer_vocab)
-    print(f"Answer vocabulary size: {n_answers}\n")
-    (RUN_DIR / "answer_vocab.json").write_text(json.dumps(answer_vocab, indent=2))
+    # Binary classification: simple_scene (0) vs complex_scene (1)
+    n_answers = 2
+    print(f"Task: binary scene complexity classification (2 classes)\n")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch,
                               shuffle=True,  collate_fn=collate_fn, num_workers=4)
@@ -335,13 +360,14 @@ def main():
     test_loader  = DataLoader(test_ds,  batch_size=args.batch,
                               shuffle=False, collate_fn=collate_fn, num_workers=4)
 
-    # Model — HGNNQAModel by default, LightHGQA with --baseline flag
+    # Model
     if args.baseline:
         print("Model: LightHGQA (scalar node-count baseline)")
         model = LightHGQA(n_answers=n_answers).to(DEVICE)
     else:
         print("Model: HGNNQAModel (learnable situation hypergraph)")
         model = HGNNQAModel(n_answers=n_answers).to(DEVICE)
+
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
@@ -350,34 +376,25 @@ def main():
         ckpt = RUN_DIR / "best_model.pt"
         if ckpt.exists():
             model.load_state_dict(torch.load(ckpt, map_location=DEVICE))
-            acc, per_cat = evaluate(model, test_loader, answer_vocab, DEVICE)
-            print(f"Test accuracy : {acc:.4f} ({acc*100:.2f}%)")
-            print("Per-category  :")
-            for cat, a in sorted(per_cat.items()):
-                label = {11: "ego-car hitting car", 43: "car hitting car"}.get(cat, f"cat {cat}")
-                print(f"  {label:<25}: {a:.4f} ({a*100:.1f}%)")
+            acc = _evaluate(model, test_loader, tokenizer, args, DEVICE)
+            print(f"Test accuracy: {acc:.4f} ({acc*100:.2f}%)")
         else:
             print("No checkpoint found. Train first.")
         return
 
-    # Training loop
+    # ── Training loop ────────────────────────────────────────────────────
     log = []
     best_val = 0.0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        epoch_loss = 0.0
+        epoch_loss = epoch_correct = epoch_total = 0
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}"):
             frames    = batch["frames"].to(DEVICE)
             questions = batch["question"]
-            answers   = batch["answer"]
+            labels    = batch["label"].to(DEVICE)   # binary 0/1
             sgs       = batch["scene_graph"]
-
-            # Map answers to indices (unknown → 0)
-            labels = torch.tensor(
-                [answer_vocab.get(a, 0) for a in answers], device=DEVICE
-            )
 
             enc = tokenizer(questions, return_tensors="pt",
                             padding=True, truncation=True, max_length=32)
@@ -391,41 +408,42 @@ def main():
                 logits = model(frames, input_ids, attention_mask, sg_counts)
             else:
                 logits = model(frames, input_ids, attention_mask, sgs)
+
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item()
 
-        avg_loss = epoch_loss / len(train_loader)
-        val_acc, val_per_cat = evaluate(model, val_loader, answer_vocab, DEVICE)
+            epoch_loss    += loss.item()
+            epoch_correct += (logits.argmax(1) == labels).sum().item()
+            epoch_total   += labels.size(0)
 
-        print(f"Epoch {epoch:02d} | loss {avg_loss:.4f} | val acc {val_acc:.4f}")
+        avg_loss  = epoch_loss / len(train_loader)
+        train_acc = epoch_correct / epoch_total
+        val_acc   = _evaluate(model, val_loader, tokenizer, args, DEVICE)
+
+        print(f"Epoch {epoch:02d} | loss {avg_loss:.4f} | "
+              f"train acc {train_acc:.3f} | val acc {val_acc:.3f}")
 
         if val_acc > best_val:
             best_val = val_acc
             torch.save(model.state_dict(), RUN_DIR / "best_model.pt")
-            print(f"  ↑ New best val accuracy: {best_val:.4f}")
+            print(f"  ↑ New best: {best_val:.3f}")
 
-        log.append({"epoch": epoch, "loss": avg_loss, "val_acc": val_acc,
-                    "val_per_cat": val_per_cat})
+        log.append({"epoch": epoch, "loss": avg_loss,
+                    "train_acc": train_acc, "val_acc": val_acc})
 
     (RUN_DIR / "training_log.json").write_text(json.dumps(log, indent=2))
 
     # Final evaluation on test set
     print("\n=== Test Set Evaluation ===")
     model.load_state_dict(torch.load(RUN_DIR / "best_model.pt", map_location=DEVICE))
-    test_acc, test_per_cat = evaluate(model, test_loader, answer_vocab, DEVICE)
+    test_acc = _evaluate(model, test_loader, tokenizer, args, DEVICE)
+    print(f"Test accuracy: {test_acc:.4f} ({test_acc*100:.2f}%)")
+    print("(Task: simple_scene vs complex_scene — random baseline = 50%)")
 
-    print(f"Overall accuracy  : {test_acc:.4f} ({test_acc*100:.2f}%)")
-    print("Per-category breakdown:")
-    cat_labels = {11: "ego-car hitting car", 43: "car hitting car"}
-    for cat, acc in sorted(test_per_cat.items()):
-        label = cat_labels.get(cat, f"category {cat}")
-        print(f"  {label:<25}: {acc:.4f} ({acc*100:.1f}%)")
-
-    results = {"overall": test_acc, "per_category": test_per_cat}
-    (RUN_DIR / "per_category_accuracy.json").write_text(json.dumps(results, indent=2))
-    print(f"\nResults saved → {RUN_DIR}/per_category_accuracy.json")
+    results = {"overall": test_acc, "task": "scene_complexity_binary"}
+    (RUN_DIR / "results.json").write_text(json.dumps(results, indent=2))
+    print(f"\nResults saved → {RUN_DIR}/results.json")
 
 
 if __name__ == "__main__":
