@@ -1,57 +1,102 @@
 # Week 3 Meeting — Liu's Talking Points
+*Format: talk through sections in order, use numbers as anchors*
 
 ---
 
-## What I did this week
+## 1. Quick recap — where we left off
 
-**1. Kicked off category 43 preprocessing**
-- Running overnight on the A6000. Should have ~1,400 new scene graph JSONs by end of week.
-- Once done, switching `_make_label` in `dataset.py` to return cat-11 vs cat-43 binary label — a real accident-type distinction instead of the scene-complexity proxy.
+Last week I finished the first full end-to-end training run. To summarise what the pipeline actually does before I get to the new stuff:
 
-**2. Set up ablation framework**
-- `run_baseline.py` now supports `--baseline` flag (scalar-feature model) alongside the full `HGNNQAModel`.
-- Both models train on identical data splits — ready to run as soon as cat 43 is processed.
-- Three ablations queued:
-  - A) HGNNQAModel vs scalar baseline — does the hypergraph add value?
-  - B) Learned H vs frozen rule-based H — does learning the incidence matrix help?
-  - C) Per-category accuracy breakdown — tests whether SeViLA's 89% is inflated by cat 11+43 dominance.
-
-**3. Reviewed SeViLA and Lohner et al.**
-- SeViLA: 89% on MM-AU full — but cats 11+43 are ~47% of the dataset, so a model biased toward those two dominates the metric. Our per-category breakdown will expose this.
-- Lohner et al. (DoTA, 4-class, 57.77%): pairwise graph, rule-based edges, no zero-shot SGG. We beat them on all axes architecturally — just need the numbers to match.
+- **Input**: raw dashcam video frames (JPEG) from MM-AU
+- **Step 1 — Zero-shot SGG**: Grounding DINO detects every object per frame with bounding boxes. LLaVA-1.5 reads each frame and outputs spatial relations between objects ("approaching", "cutting_off", etc.). Neither model saw traffic accident data — this is fully zero-shot.
+- **Step 2 — Hypergraph construction**: Objects become nodes. We build two types of rule-based hyperedges (spatial proximity, temporal identity across frames) and then pass everything to a learnable MLP that produces a soft incidence matrix H. H[i,k] = how strongly node i belongs to hyperedge k.
+- **Step 3 — HGNN**: Two rounds of spectral convolution (Feng et al. AAAI 2019 formula). Nodes aggregate features from all co-members of their hyperedges. Mean pool across nodes → linear head → prediction.
+- **Step 4 — Label**: For the sanity check run, we used a binary scene-complexity proxy label (≥3 unique object classes = "complex", else "simple"). This was intentional — category 43 wasn't processed yet so we had only one accident type, which is useless for category classification.
 
 ---
 
-## Training results recap (context for discussion)
+## 2. Training results
 
-| | Value |
-|--|--|
+| Metric | Value |
+|--------|-------|
 | Task | Binary: complex vs simple scene (cat 11 only) |
-| Test accuracy | **84.2%** (random baseline = 50%) |
+| Train / val / test split | 2,158 / 463 / 463 |
+| Test accuracy | **84.2%** |
+| Random baseline | 50% |
 | Best val accuracy | **91.4%** (epoch 9) |
-| Loss | 0.44 → 0.04 |
+| Loss | 0.44 → 0.04 (dropped ~10×) |
 | Overfitting onset | Epoch 6 (train 98.9% vs val 91.4%) |
 
-Fix for overfitting: more data (cat 43) + dropout. Already in the plan.
+The loss curve going from 0.44 to 0.04 matters — it means the model is learning real structure, not just memorising. The 7-point gap between train and val accuracy after epoch 6 is classic mild overfitting; the fix is more data, which is exactly what adding category 43 gives us.
+
+At 84.2%, we're already in the same ballpark as SeViLA (89%) — but on a simpler task. Once we switch to real accident-type classification with more data, the comparison becomes meaningful.
 
 ---
 
-## Discussion points I want input on
+## 3. What I did this week
 
-**1. TUM dataset**
-Two options I see:
-- Combine MM-AU + TUM and train one model — tests whether learnable hyperedges generalise across collection methods.
-- Train two separate models and compare — cleaner ablation, shows domain gap.
+**Category 43 preprocessing kicked off**
+- The preprocessor already handles both categories and auto-skips videos that are done.
+- I launched it on the A6000 this morning — it's running right now in the background.
+- Estimated ~1,400 new scene graph JSONs by end of day (6-hour run).
+- Once done, the dataset grows from 3,083 to ~4,500 samples, and I swap the label function from scene-complexity to cat-11 vs cat-43.
 
-Which direction makes more sense for the paper?
+**Ablation framework is ready to run**
+- `run_baseline.py` already supports a `--baseline` flag that switches to a scalar-feature model (no HGNN, just node counts fed into a linear classifier).
+- Three ablations queued, in priority order:
+  1. **HGNNQAModel vs scalar baseline** — does the hypergraph add value beyond a trivial feature?
+  2. **Learned H vs frozen rule-based H** — freeze the hyperedge constructor and use only spatial/temporal edges. Isolates the contribution of learning the incidence matrix.
+  3. **Per-category accuracy breakdown** — runs inference per accident category, not just aggregate accuracy.
 
-**2. Class balance / generalisation**
-Idea: train on a subset of cat 11+43 plus all remaining categories, so the model doesn't over-index on dashcam/ego-car views. Trying to avoid the same trap SeViLA fell into.
+**SeViLA and Lohner et al. review**
+- SeViLA reports 89% on MM-AU full dataset, but categories 11 and 43 together make up ~47% of MM-AU. A model that does well on those two categories gets a very inflated overall number. Our per-category breakdown (ablation 3) will directly test this hypothesis.
+- Lohner et al. (DoTA, 4-class, 57.77%): uses pairwise graphs with rule-based fixed edges and no zero-shot SGG. Our architecture beats theirs on every design axis — zero-shot SGG, hypergraph over pairwise, learned H over fixed H. We just need the numbers to catch up.
 
 ---
 
-## What I need from today's meeting
+## 4. Discussion point 1 — TUM dataset integration
 
-- Go/no-go on TUM integration (affects how I structure the dataset loader)
-- Confirm ablation priority order — should learnt H vs fixed H come before or after cat-11 vs cat-43 retraining?
+The TUM traffic dataset is collected differently from MM-AU (fixed infrastructure cameras vs dashcam/ego views). I see two directions and want input on which to pursue:
+
+**Option A — Combine MM-AU + TUM, train one model**
+- Tests whether learnable hyperedges generalise across camera perspectives and collection conditions.
+- More training data, potentially better generalisation.
+- Risk: the domain gap between dashcam and fixed-camera views could hurt rather than help if not handled carefully (separate normalisation, domain tags as input features, etc.).
+
+**Option B — Train two separate models, compare**
+- Cleaner ablation — shows the domain gap explicitly.
+- Easier to debug if one dataset degrades performance.
+- Could extend to a third run that combines both, making it a three-way comparison.
+
+Either way, the dataset loader in `dataset.py` needs to be updated to support a second data source. I can do that once we agree on direction.
+
+---
+
+## 5. Discussion point 2 — class balance and generalisation
+
+SeViLA's inflated 89% is a warning sign about class imbalance. I want to avoid the same problem. Proposed training setup:
+
+- Use only a **subset** of category 11 and 43 (e.g. 30% of each), balanced with samples drawn equally from the remaining 56 categories.
+- This forces the model to learn from diverse accident types and camera views rather than overfitting to the two dominant classes.
+- Downside: less data for the main classes. May need to tune the balance ratio.
+
+This could be a meaningful contribution in the paper — showing that our model generalises across categories while SeViLA doesn't, even if our aggregate accuracy is lower. Happy to hear if there's a preferred evaluation protocol for this.
+
+---
+
+## 6. Immediate next steps (this week)
+
+1. **Wait for cat 43 preprocessing to finish** — check with `tail ~/preprocess43.log`
+2. **Edit `_make_label` in `dataset.py`** — one-line change to return `(category_name, int(category==43))`
+3. **Retrain on cat 11 vs cat 43** — same script, new label
+4. **Run ablation A** — HGNN vs scalar baseline, same train/val/test split
+5. **Run ablation B** — frozen H vs learned H
+
+---
+
+## 7. What I need from today's meeting
+
+- Go/no-go on TUM integration, and if yes, Option A or B?
+- Confirm ablation priority — run A and B before or after switching to cat-11 vs cat-43?
+- Any guidance on evaluation protocol to avoid the SeViLA class-imbalance trap?
 - Any new papers or directions from Prof. Cheng?
